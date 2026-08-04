@@ -1,26 +1,26 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <ESP32Ping.h>
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "driver/twai.h" // ESP32-S3 TWAI (CAN Bus) driver
 
 // =========================================================================
 // VEHICLE IDENTIFICATION & DEVICE CONFIGURATION
 // =========================================================================
 const char* VEHICLE_VIN = "WDB2110001A123456"; // Alvázszám (Vehicle Identification Number)
-const char* API_BASE_URL = "http://autotracker.hu/api/v1";
+const char* API_DOMAIN = "autotracker.hu";
+const IPAddress FALLBACK_API_IP(159, 195, 55, 240);
 
 // Wi-Fi credentials
 const char* WIFI_SSID = "awshotspot";
 const char* WIFI_PASS = "12345678";
 
-// Target host to ping
-const char* PING_HOST = "autotracker.hu";
-
 // Timing Intervals
-const unsigned long PING_INTERVAL_MS = 10000;     // Ping test every 10s
+const unsigned long PING_INTERVAL_MS = 10000;            // Ping test every 10s
 const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 5000; // Default telemetry push every 5s
 
 // TWAI / CAN Bus Pin configuration for ESP32-S3
@@ -244,6 +244,7 @@ void connectToWifi() {
 
     if (WiFi.status() == WL_CONNECTED) {
         setRgbColor(0, 0, 128); // Solid Blue
+
         Serial.println("SUCCESS: Connected to Wi-Fi network!");
         Serial.printf("  VIN Number:  %s\n", VEHICLE_VIN);
         Serial.printf("  SSID:        %s\n", WiFi.SSID().c_str());
@@ -267,7 +268,7 @@ void connectToWifi() {
 bool performPingTest() {
     pingCount++;
     Serial.println("\n-------------------------------------------------------");
-    Serial.printf("Ping Test #%u -> %s\n", pingCount, PING_HOST);
+    Serial.printf("Ping Test #%u -> %s\n", pingCount, API_DOMAIN);
     Serial.println("-------------------------------------------------------");
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -280,17 +281,20 @@ bool performPingTest() {
     }
 
     IPAddress targetIp;
-    bool resolved = WiFi.hostByName(PING_HOST, targetIp);
+    bool resolved = WiFi.hostByName(API_DOMAIN, targetIp);
     if (resolved) {
-        Serial.printf("Resolved %s -> %s\n", PING_HOST, targetIp.toString().c_str());
+        Serial.printf("Resolved %s -> %s\n", API_DOMAIN, targetIp.toString().c_str());
+    } else {
+        targetIp = FALLBACK_API_IP;
+        Serial.printf("DNS Failed for %s. Using Fallback IP: %s\n", API_DOMAIN, targetIp.toString().c_str());
     }
 
-    bool pingResult = Ping.ping(PING_HOST, 4);
+    bool pingResult = Ping.ping(targetIp, 4);
 
     if (pingResult) {
         float avgTime = Ping.averageTime();
         Serial.printf("PING SUCCESS! Target: %s (%s) | Avg Time: %.2f ms\n",
-                      PING_HOST, targetIp.toString().c_str(), avgTime);
+                      API_DOMAIN, targetIp.toString().c_str(), avgTime);
         setRgbColor(0, 128, 0); // Green Flash
         delay(400);
         setRgbColor((deviceConfig.mode == "SERVICE") ? 0 : 0, 
@@ -298,12 +302,50 @@ bool performPingTest() {
                     128); // Restore Cyan or Blue
         return true;
     } else {
-        Serial.printf("PING FAILED! Host %s did not respond.\n", PING_HOST);
+        Serial.printf("PING FAILED! Host %s (%s) did not respond.\n", API_DOMAIN, targetIp.toString().c_str());
         setRgbColor(128, 0, 0);
         delay(400);
         if (WiFi.status() == WL_CONNECTED) setRgbColor(0, 0, 128);
         return false;
     }
+}
+
+// Robust HTTPS POST helper supporting automatic 308 redirect handling & IP fallback with SNI Host header
+int executeApiPost(const String& path, const String& jsonBody, String& responseOut) {
+    WiFiClientSecure client;
+    client.setInsecure(); // Bypass SSL certificate verification for maximum compatibility
+    client.setTimeout(10000);
+
+    IPAddress targetIp;
+    bool resolved = WiFi.hostByName(API_DOMAIN, targetIp);
+    if (!resolved) {
+        targetIp = FALLBACK_API_IP;
+    }
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Follow 301/302/307/308 redirects automatically
+    http.setTimeout(10000);
+
+    String fullUrl = "https://" + targetIp.toString() + path;
+
+    http.begin(client, fullUrl);
+    http.addHeader("Host", API_DOMAIN);
+    http.addHeader("Content-Type", "application/json");
+
+    Serial.printf("POST -> https://%s%s (via %s)\nPayload: %s\n",
+                  API_DOMAIN, path.c_str(), targetIp.toString().c_str(), jsonBody.c_str());
+
+    int httpCode = http.POST(jsonBody);
+
+    if (httpCode > 0) {
+        responseOut = http.getString();
+        Serial.printf("HTTP Status: %d | Server Response: %s\n", httpCode, responseOut.c_str());
+    } else {
+        Serial.printf("HTTP Client Error: %s (Code %d)\n", http.errorToString(httpCode).c_str(), httpCode);
+    }
+
+    http.end();
+    return httpCode;
 }
 
 // Fetch Vehicle Configuration and Task from autotracker.hu API
@@ -314,11 +356,6 @@ void fetchVehicleConfigFromApi() {
     Serial.printf(" API Query: Registering VIN '%s' with autotracker.hu\n", VEHICLE_VIN);
     Serial.println("=======================================================");
 
-    HTTPClient http;
-    String url = String(API_BASE_URL) + "/vehicle/config";
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-
     StaticJsonDocument<256> reqDoc;
     reqDoc["vin"] = VEHICLE_VIN;
     reqDoc["mac"] = WiFi.macAddress();
@@ -328,14 +365,10 @@ void fetchVehicleConfigFromApi() {
     String requestBody;
     serializeJson(reqDoc, requestBody);
 
-    Serial.printf("POST -> %s\nPayload: %s\n", url.c_str(), requestBody.c_str());
+    String response;
+    int httpResponseCode = executeApiPost("/api/v1/vehicle/config", requestBody, response);
 
-    int httpResponseCode = http.POST(requestBody);
-
-    if (httpResponseCode > 0) {
-        String response = http.getString();
-        Serial.printf("HTTP Response Code: %d\nResponse: %s\n", httpResponseCode, response.c_str());
-
+    if (httpResponseCode == 200 || httpResponseCode == 201) {
         StaticJsonDocument<512> resDoc;
         DeserializationError error = deserializeJson(resDoc, response);
 
@@ -355,18 +388,14 @@ void fetchVehicleConfigFromApi() {
             Serial.printf("  Diagnostics:     %s\n", deviceConfig.requestFullDiagnostics ? "ENABLED (SERVICE)" : "STANDARD");
             Serial.println("--------------------------------------------");
 
-            // Cyan LED if Service Mode is configured via Web interface
             if (deviceConfig.mode == "SERVICE") {
                 setRgbColor(0, 128, 128); // Cyan
             }
         } else {
             Serial.printf("JSON Parse Error: %s\n", error.c_str());
         }
-    } else {
-        Serial.printf("HTTP Request Failed. Error: %s\n", http.errorToString(httpResponseCode).c_str());
     }
 
-    http.end();
     Serial.flush();
 }
 
@@ -381,11 +410,6 @@ void sendTelemetryToApi() {
     Serial.printf(" Telemetry Push #%u -> autotracker.hu API\n", telemetryPushCount);
     Serial.println("-------------------------------------------------------");
 
-    HTTPClient http;
-    String url = String(API_BASE_URL) + "/vehicle/telemetry";
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-
     StaticJsonDocument<512> doc;
     doc["vin"] = VEHICLE_VIN;
     doc["timestamp"] = millis();
@@ -399,7 +423,6 @@ void sendTelemetryToApi() {
     telemetry["battery_v"] = currentTelemetry.batteryVoltageV;
     telemetry["oil_temp_c"] = currentTelemetry.oilTempC;
 
-    // Additional service/diagnostic telemetry if configured by web admin
     if (deviceConfig.mode == "SERVICE" || deviceConfig.requestFullDiagnostics) {
         JsonObject serviceDiag = doc.createNestedObject("service_diagnostics");
         serviceDiag["dtc_active"] = currentTelemetry.dtcActive;
@@ -410,37 +433,29 @@ void sendTelemetryToApi() {
     String payload;
     serializeJson(doc, payload);
 
-    Serial.printf("POST -> %s\nPayload: %s\n", url.c_str(), payload.c_str());
+    String response;
+    int httpCode = executeApiPost("/api/v1/vehicle/telemetry", payload, response);
 
-    int httpCode = http.POST(payload);
-
-    if (httpCode > 0) {
-        String resp = http.getString();
-        Serial.printf("HTTP Status: %d | Server Response: %s\n", httpCode, resp.c_str());
-
-        // Flash Green LED on successful telemetry transmission
-        setRgbColor(0, 128, 0); // Green
+    if (httpCode == 200 || httpCode == 201) {
+        setRgbColor(0, 128, 0); // Green Flash
         delay(300);
         setRgbColor((deviceConfig.mode == "SERVICE") ? 0 : 0, 
                     (deviceConfig.mode == "SERVICE") ? 128 : 0, 
                     128); // Cyan if SERVICE, Blue if NORMAL
 
-        // Check if server requested a dynamic config update (e.g. user toggled Service Mode on web dashboard)
         StaticJsonDocument<256> respDoc;
-        if (!deserializeJson(respDoc, resp)) {
+        if (!deserializeJson(respDoc, response)) {
             if (respDoc.containsKey("mode") && respDoc["mode"] != deviceConfig.mode) {
                 Serial.printf("CONFIG CHANGE DETECTED FROM SERVER! New Mode: %s\n", respDoc["mode"].as<const char*>());
                 fetchVehicleConfigFromApi();
             }
         }
     } else {
-        Serial.printf("HTTP Error: %s\n", http.errorToString(httpCode).c_str());
         setRgbColor(128, 0, 0); // Red
         delay(300);
         setRgbColor(0, 0, 128);
     }
 
-    http.end();
     Serial.flush();
 }
 
@@ -485,7 +500,6 @@ void setup() {
 void loop() {
     unsigned long currentMillis = millis();
 
-    // Periodically send CAN bus telemetry to autotracker.hu API based on server interval
     unsigned long interval = deviceConfig.configLoaded ? deviceConfig.updateIntervalMs : DEFAULT_TELEMETRY_INTERVAL_MS;
     if (currentMillis - lastTelemetryTime >= interval) {
         lastTelemetryTime = currentMillis;
