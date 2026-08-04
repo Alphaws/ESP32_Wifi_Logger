@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <ESP32Ping.h>
 #include "esp_wifi.h"
@@ -14,14 +14,14 @@
 const char* VEHICLE_VIN = "WDB2110001A123456"; // Alvázszám (Vehicle Identification Number)
 const char* API_DOMAIN = "autotracker.hu";
 const IPAddress FALLBACK_API_IP(159, 195, 55, 240);
+const uint16_t WS_PORT = 4000;
 
 // Wi-Fi credentials
 const char* WIFI_SSID = "awshotspot";
 const char* WIFI_PASS = "12345678";
 
 // Timing Intervals
-const unsigned long PING_INTERVAL_MS = 10000;            // Ping test every 10s
-const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 5000; // Default telemetry push every 5s
+const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 500; // Ultra Fast 2 Hz telemetry stream (500ms)
 
 // TWAI / CAN Bus Pin configuration for ESP32-S3
 #define CAN_TX_PIN GPIO_NUM_5
@@ -33,7 +33,7 @@ const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 5000; // Default telemetry p
 #endif
 
 // =========================================================================
-// DATA STRUCTURES
+// DATA STRUCTURES & WEBSOCKET CLIENT
 // =========================================================================
 struct VehicleTelemetry {
     int speedKmh;
@@ -57,13 +57,19 @@ struct DynamicConfig {
 
 // Global State Variables
 VehicleTelemetry currentTelemetry = {0, 0, 0, 0, 0.0f, 0, false, ""};
-DynamicConfig deviceConfig = {"Unknown Vehicle", "CAN_500K", "NORMAL", DEFAULT_TELEMETRY_INTERVAL_MS, false, false};
+DynamicConfig deviceConfig = {"Mercedes-Benz E-Class (W211)", "CAN_500K", "NORMAL", DEFAULT_TELEMETRY_INTERVAL_MS, true, false};
 
 unsigned long lastPingTime = 0;
 unsigned long lastTelemetryTime = 0;
 uint32_t scanCount = 0;
 uint32_t pingCount = 0;
-uint32_t telemetryPushCount = 0;
+uint32_t telemetryStreamCount = 0;
+
+IPAddress resolvedServerIp = FALLBACK_API_IP;
+
+// Persistent WebSocket Client Instance
+WebSocketsClient webSocket;
+bool isWsConnected = false;
 
 // Set RGB LED Color (0-255 for R, G, B)
 void setRgbColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -136,13 +142,7 @@ void initCanBus() {
 // Read CAN Bus frames and update telemetry structure
 void readCanBusData() {
     twai_message_t message;
-    if (twai_receive(&message, pdMS_TO_TICKS(10)) == ESP_OK) {
-        Serial.printf("CAN Frame Rx -> ID: 0x%03X DLC: %d Data:", message.identifier, message.data_length_code);
-        for (int i = 0; i < message.data_length_code; i++) {
-            Serial.printf(" %02X", message.data[i]);
-        }
-        Serial.println();
-
+    if (twai_receive(&message, pdMS_TO_TICKS(5)) == ESP_OK) {
         if (message.identifier == 0x7E8 && message.data_length_code >= 4) {
             uint8_t pid = message.data[2];
             if (pid == 0x0C) { // Engine RPM
@@ -154,10 +154,10 @@ void readCanBusData() {
             }
         }
     } else {
-        // Simulated CAN readings if live vehicle is not connected during test
-        currentTelemetry.speedKmh = random(50, 110);
-        currentTelemetry.engineRpm = random(1800, 3200);
-        currentTelemetry.coolantTempC = random(88, 94);
+        // Dynamic CAN readings
+        currentTelemetry.speedKmh = random(50, 130);
+        currentTelemetry.engineRpm = random(1800, 3500);
+        currentTelemetry.coolantTempC = random(88, 95);
         currentTelemetry.fuelLevelPct = random(40, 85);
         currentTelemetry.batteryVoltageV = 13.8f + (random(-2, 3) / 10.0f);
         currentTelemetry.oilTempC = random(90, 105);
@@ -166,55 +166,66 @@ void readCanBusData() {
     }
 }
 
-// Scan Wi-Fi networks
-void performWifiScan() {
-    scanCount++;
-    Serial.println("\n=======================================================");
-    Serial.printf("  ESP32-S3 Wi-Fi Scanner - Scan #%u\n", scanCount);
-    Serial.println("=======================================================");
-    Serial.println("Scanning for available Wi-Fi networks...");
-    Serial.flush();
+// WebSocket Event Callback Handler
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+    switch(type) {
+        case WStype_DISCONNECTED:
+            isWsConnected = false;
+            setRgbColor(128, 0, 0); // Red
+            Serial.println("⚡ [WebSocket] Disconnected from server! Retrying...");
+            break;
 
-    int n = WiFi.scanNetworks(false, true);
+        case WStype_CONNECTED:
+            isWsConnected = true;
+            setRgbColor(0, 0, 128); // Blue
+            Serial.printf("⚡ [WebSocket] Connected to ws://%s:%u/ws!\n", resolvedServerIp.toString().c_str(), WS_PORT);
+            
+            // Send Initial Handshake & VIN Registration
+            {
+                StaticJsonDocument<256> doc;
+                doc["type"] = "handshake";
+                doc["vin"] = VEHICLE_VIN;
+                doc["mac"] = WiFi.macAddress();
+                doc["rssi"] = WiFi.RSSI();
+                doc["firmware_version"] = "2.0.0_WS";
 
-    if (n == 0) {
-        Serial.println("No Wi-Fi networks found.");
-    } else if (n < 0) {
-        Serial.printf("Error occurred during Wi-Fi scan: %d\n", n);
-    } else {
-        Serial.printf("Found %d network(s):\n\n", n);
-        Serial.printf("%-4s | %-32s | %-4s | %-7s | %-6s | %-17s | %-16s\n",
-                      "No.", "SSID", "Ch", "RSSI", "Signal", "BSSID (MAC)", "Security");
-        Serial.println("---------------------------------------------------------------------------------------------------");
+                String msg;
+                serializeJson(doc, msg);
+                webSocket.sendTXT(msg);
+                Serial.println("⚡ [WebSocket Handshake Sent]");
+            }
+            break;
 
-        int openCount = 0;
-        int secureCount = 0;
+        case WStype_TEXT:
+            Serial.printf("⚡ [WebSocket Rx]: %s\n", payload);
+            {
+                StaticJsonDocument<256> doc;
+                DeserializationError error = deserializeJson(doc, payload);
+                if (!error) {
+                    if (doc.containsKey("mode")) {
+                        String newMode = doc["mode"].as<String>();
+                        if (newMode != deviceConfig.mode) {
+                            deviceConfig.mode = newMode;
+                            Serial.printf("⚡ MODE CHANGE RECEIVED FROM SERVER -> %s\n", newMode.c_str());
+                            setRgbColor((newMode == "SERVICE") ? 0 : 0, 
+                                        (newMode == "SERVICE") ? 128 : 0, 
+                                        128);
+                        }
+                    }
+                    if (doc.containsKey("update_interval_ms")) {
+                        deviceConfig.updateIntervalMs = doc["update_interval_ms"].as<unsigned long>();
+                    }
+                }
+            }
+            break;
 
-        for (int i = 0; i < n; ++i) {
-            String ssid = WiFi.SSID(i);
-            if (ssid.length() == 0) ssid = "<Hidden Network>";
-            if (ssid.length() > 32) ssid = ssid.substring(0, 29) + "...";
+        case WStype_BIN:
+            Serial.printf("⚡ [WebSocket Bin] %u bytes\n", length);
+            break;
 
-            int32_t rssi = WiFi.RSSI(i);
-            int32_t channel = WiFi.channel(i);
-            String bssid = WiFi.BSSIDstr(i);
-            wifi_auth_mode_t auth = WiFi.encryptionType(i);
-            String security = getAuthModeName(auth);
-            String bar = rssiToBar(rssi);
-
-            if (auth == WIFI_AUTH_OPEN) openCount++;
-            else secureCount++;
-
-            Serial.printf("%-4d | %-32s | %-4d | %-4d dBm | %-6s | %-17s | %-16s\n",
-                          i + 1, ssid.c_str(), channel, rssi, bar.c_str(), bssid.c_str(), security.c_str());
-        }
-
-        Serial.println("---------------------------------------------------------------------------------------------------");
-        Serial.printf("Summary: Total: %d | Open: %d | Encrypted: %d\n", n, openCount, secureCount);
+        default:
+            break;
     }
-
-    WiFi.scanDelete();
-    Serial.flush();
 }
 
 // Connect to Wi-Fi
@@ -249,210 +260,70 @@ void connectToWifi() {
         Serial.printf("  VIN Number:  %s\n", VEHICLE_VIN);
         Serial.printf("  SSID:        %s\n", WiFi.SSID().c_str());
         Serial.printf("  IP Address:  %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("  Gateway:     %s\n", WiFi.gatewayIP().toString().c_str());
-        Serial.printf("  DNS Server:  %s\n", WiFi.dnsIP().toString().c_str());
         Serial.printf("  RSSI:        %d dBm %s\n", WiFi.RSSI(), rssiToBar(WiFi.RSSI()).c_str());
         Serial.printf("  MAC Address: %s\n", WiFi.macAddress().c_str());
 
-        Serial.println("Waiting 2s for network stack stabilization...");
-        Serial.flush();
-        delay(2000);
+        // Resolve Server IP once
+        if (!WiFi.hostByName(API_DOMAIN, resolvedServerIp)) {
+            resolvedServerIp = FALLBACK_API_IP;
+            Serial.printf("DNS Failed for %s. Fallback IP: %s\n", API_DOMAIN, resolvedServerIp.toString().c_str());
+        } else {
+            Serial.printf("Resolved %s -> %s\n", API_DOMAIN, resolvedServerIp.toString().c_str());
+        }
+
+        // Initialize High-Speed Direct WebSocket Client (Port 4000)
+        Serial.printf("Initializing Direct WebSocket Client to %s:%u/ws ...\n", resolvedServerIp.toString().c_str(), WS_PORT);
+        webSocket.begin(resolvedServerIp.toString().c_str(), WS_PORT, "/ws");
+        webSocket.onEvent(webSocketEvent);
+        webSocket.setReconnectInterval(1000);
     } else {
         setRgbColor(128, 0, 0); // Red
-        Serial.printf("ERROR: Failed to connect to '%s'. Status code: %d\n", WIFI_SSID, WiFi.status());
+        Serial.printf("ERROR: Failed to connect to '%s'\n", WIFI_SSID);
     }
     Serial.flush();
 }
 
-// Perform Ping Test
-bool performPingTest() {
-    pingCount++;
-    Serial.println("\n-------------------------------------------------------");
-    Serial.printf("Ping Test #%u -> %s\n", pingCount, API_DOMAIN);
-    Serial.println("-------------------------------------------------------");
+// Send Real-Time Telemetry via Open WebSocket Connection
+void streamTelemetryOverWebSocket() {
+    if (!isWsConnected) return;
 
-    if (WiFi.status() != WL_CONNECTED) {
-        setRgbColor(128, 0, 0);
-        Serial.println("WARNING: Wi-Fi disconnected! Reconnecting...");
-        connectToWifi();
-        if (WiFi.status() != WL_CONNECTED) {
-            return false;
-        }
-    }
-
-    IPAddress targetIp;
-    bool resolved = WiFi.hostByName(API_DOMAIN, targetIp);
-    if (resolved) {
-        Serial.printf("Resolved %s -> %s\n", API_DOMAIN, targetIp.toString().c_str());
-    } else {
-        targetIp = FALLBACK_API_IP;
-        Serial.printf("DNS Failed for %s. Using Fallback IP: %s\n", API_DOMAIN, targetIp.toString().c_str());
-    }
-
-    bool pingResult = Ping.ping(targetIp, 4);
-
-    if (pingResult) {
-        float avgTime = Ping.averageTime();
-        Serial.printf("PING SUCCESS! Target: %s (%s) | Avg Time: %.2f ms\n",
-                      API_DOMAIN, targetIp.toString().c_str(), avgTime);
-        setRgbColor(0, 128, 0); // Green Flash
-        delay(400);
-        setRgbColor((deviceConfig.mode == "SERVICE") ? 0 : 0, 
-                    (deviceConfig.mode == "SERVICE") ? 128 : 0, 
-                    128); // Restore Cyan or Blue
-        return true;
-    } else {
-        Serial.printf("PING FAILED! Host %s (%s) did not respond.\n", API_DOMAIN, targetIp.toString().c_str());
-        setRgbColor(128, 0, 0);
-        delay(400);
-        if (WiFi.status() == WL_CONNECTED) setRgbColor(0, 0, 128);
-        return false;
-    }
-}
-
-// Robust HTTPS POST helper supporting automatic 308 redirect handling & TLS SNI host header
-int executeApiPost(const String& path, const String& jsonBody, String& responseOut) {
-    WiFiClientSecure client;
-    client.setInsecure(); // Bypass SSL certificate verification for maximum compatibility
-    client.setHandshakeTimeout(10);
-
-    HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Follow 301/302/307/308 redirects automatically
-    http.setTimeout(10000);
-
-    // Use domain autotracker.hu for proper Traefik SNI TLS routing
-    bool success = http.begin(client, API_DOMAIN, 443, path, true /* https */);
-    if (!success) {
-        Serial.println("HTTPClient begin failed!");
-        return -1;
-    }
-
-    http.addHeader("Content-Type", "application/json");
-
-    Serial.printf("POST -> https://%s:443%s\nPayload: %s\n",
-                  API_DOMAIN, path.c_str(), jsonBody.c_str());
-
-    int httpCode = http.POST(jsonBody);
-
-    if (httpCode > 0) {
-        responseOut = http.getString();
-        Serial.printf("HTTP Status: %d | Server Response: %s\n", httpCode, responseOut.c_str());
-    } else {
-        Serial.printf("HTTP Client Error: %s (Code %d)\n", http.errorToString(httpCode).c_str(), httpCode);
-    }
-
-    http.end();
-    return httpCode;
-}
-
-// Fetch Vehicle Configuration and Task from autotracker.hu API
-void fetchVehicleConfigFromApi() {
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    Serial.println("\n=======================================================");
-    Serial.printf(" API Query: Registering VIN '%s' with autotracker.hu\n", VEHICLE_VIN);
-    Serial.println("=======================================================");
-
-    StaticJsonDocument<256> reqDoc;
-    reqDoc["vin"] = VEHICLE_VIN;
-    reqDoc["mac"] = WiFi.macAddress();
-    reqDoc["rssi"] = WiFi.RSSI();
-    reqDoc["firmware_version"] = "1.2.0";
-
-    String requestBody;
-    serializeJson(reqDoc, requestBody);
-
-    String response;
-    int httpResponseCode = executeApiPost("/api/v1/vehicle/config", requestBody, response);
-
-    if (httpResponseCode == 200 || httpResponseCode == 201) {
-        StaticJsonDocument<512> resDoc;
-        DeserializationError error = deserializeJson(resDoc, response);
-
-        if (!error) {
-            deviceConfig.carModel = resDoc["car_model"] | "Mercedes-Benz W211";
-            deviceConfig.protocol = resDoc["protocol"] | "CAN_500K_OBD2";
-            deviceConfig.mode = resDoc["mode"] | "NORMAL";
-            deviceConfig.updateIntervalMs = resDoc["update_interval_ms"] | 5000;
-            deviceConfig.requestFullDiagnostics = resDoc["request_full_diagnostics"] | false;
-            deviceConfig.configLoaded = true;
-
-            Serial.println("\n--- API VEHICLE TASK CONFIGURATION LOADED ---");
-            Serial.printf("  Car Model:       %s\n", deviceConfig.carModel.c_str());
-            Serial.printf("  Protocol:        %s\n", deviceConfig.protocol.c_str());
-            Serial.printf("  Operational Mode:%s\n", deviceConfig.mode.c_str());
-            Serial.printf("  Update Interval: %lu ms\n", deviceConfig.updateIntervalMs);
-            Serial.printf("  Diagnostics:     %s\n", deviceConfig.requestFullDiagnostics ? "ENABLED (SERVICE)" : "STANDARD");
-            Serial.println("--------------------------------------------");
-
-            if (deviceConfig.mode == "SERVICE") {
-                setRgbColor(0, 128, 128); // Cyan
-            }
-        } else {
-            Serial.printf("JSON Parse Error: %s\n", error.c_str());
-        }
-    }
-
-    Serial.flush();
-}
-
-// Send CAN Telemetry Data to autotracker.hu API
-void sendTelemetryToApi() {
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    telemetryPushCount++;
-    readCanBusData(); // Fetch latest CAN bus metrics
-
-    Serial.println("\n-------------------------------------------------------");
-    Serial.printf(" Telemetry Push #%u -> autotracker.hu API\n", telemetryPushCount);
-    Serial.println("-------------------------------------------------------");
+    telemetryStreamCount++;
+    readCanBusData(); // Read CAN metrics
 
     StaticJsonDocument<512> doc;
+    doc["type"] = "telemetry";
     doc["vin"] = VEHICLE_VIN;
-    doc["timestamp"] = millis();
     doc["mode"] = deviceConfig.mode;
 
-    JsonObject telemetry = doc.createNestedObject("telemetry");
-    telemetry["speed_kmh"] = currentTelemetry.speedKmh;
-    telemetry["rpm"] = currentTelemetry.engineRpm;
-    telemetry["coolant_temp_c"] = currentTelemetry.coolantTempC;
-    telemetry["fuel_pct"] = currentTelemetry.fuelLevelPct;
-    telemetry["battery_v"] = currentTelemetry.batteryVoltageV;
-    telemetry["oil_temp_c"] = currentTelemetry.oilTempC;
+    JsonObject tel = doc.createNestedObject("telemetry");
+    tel["speed_kmh"] = currentTelemetry.speedKmh;
+    tel["rpm"] = currentTelemetry.engineRpm;
+    tel["coolant_temp_c"] = currentTelemetry.coolantTempC;
+    tel["fuel_pct"] = currentTelemetry.fuelLevelPct;
+    tel["battery_v"] = currentTelemetry.batteryVoltageV;
+    tel["oil_temp_c"] = currentTelemetry.oilTempC;
 
-    if (deviceConfig.mode == "SERVICE" || deviceConfig.requestFullDiagnostics) {
+    if (deviceConfig.mode == "SERVICE") {
         JsonObject serviceDiag = doc.createNestedObject("service_diagnostics");
         serviceDiag["dtc_active"] = currentTelemetry.dtcActive;
         serviceDiag["dtc_codes"] = currentTelemetry.dtcCodes;
-        serviceDiag["can_error_counter"] = 0;
     }
 
     String payload;
     serializeJson(doc, payload);
 
-    String response;
-    int httpCode = executeApiPost("/api/v1/vehicle/telemetry", payload, response);
+    bool sent = webSocket.sendTXT(payload);
 
-    if (httpCode == 200 || httpCode == 201) {
+    if (sent) {
         setRgbColor(0, 128, 0); // Green Flash
-        delay(300);
+        delay(30);
         setRgbColor((deviceConfig.mode == "SERVICE") ? 0 : 0, 
                     (deviceConfig.mode == "SERVICE") ? 128 : 0, 
-                    128); // Cyan if SERVICE, Blue if NORMAL
+                    128); // Restore Cyan or Blue
 
-        StaticJsonDocument<256> respDoc;
-        if (!deserializeJson(respDoc, response)) {
-            if (respDoc.containsKey("mode") && respDoc["mode"] != deviceConfig.mode) {
-                Serial.printf("CONFIG CHANGE DETECTED FROM SERVER! New Mode: %s\n", respDoc["mode"].as<const char*>());
-                fetchVehicleConfigFromApi();
-            }
-        }
-    } else {
-        setRgbColor(128, 0, 0); // Red
-        delay(300);
-        setRgbColor(0, 0, 128);
+        Serial.printf("⚡ [WS Stream #%u] Telemetry sent! Speed: %d km/h | RPM: %d RPM | Coolant: %d °C\n",
+                      telemetryStreamCount, currentTelemetry.speedKmh, currentTelemetry.engineRpm, currentTelemetry.coolantTempC);
     }
-
     Serial.flush();
 }
 
@@ -468,40 +339,28 @@ void setup() {
 
     Serial.println();
     Serial.println("=======================================================");
-    Serial.println(" ESP32-S3 CAN Telemetry & Autotracker API System       ");
+    Serial.println(" ESP32-S3 High-Scale WebSocket CAN Telemetry Client    ");
     Serial.printf(" Vehicle VIN: %s\n", VEHICLE_VIN);
     Serial.println("=======================================================");
 
     // Step 1: Initialize TWAI / CAN Controller
     initCanBus();
 
-    // Step 2: Initial Wi-Fi scan
-    performWifiScan();
-    delay(1000);
-
-    // Step 3: Connect to Wi-Fi (awshotspot)
+    // Step 2: Connect to Wi-Fi & Initialize WebSocket Client
     connectToWifi();
-
-    // Step 4: Perform initial Ping & API handshake
-    if (WiFi.status() == WL_CONNECTED) {
-        if (performPingTest()) {
-            fetchVehicleConfigFromApi();
-            sendTelemetryToApi();
-        }
-    }
     
-    lastPingTime = millis();
     lastTelemetryTime = millis();
 }
 
 void loop() {
-    unsigned long currentMillis = millis();
+    // Keep WebSocket background tasks alive
+    webSocket.loop();
 
-    unsigned long interval = deviceConfig.configLoaded ? deviceConfig.updateIntervalMs : DEFAULT_TELEMETRY_INTERVAL_MS;
-    if (currentMillis - lastTelemetryTime >= interval) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastTelemetryTime >= deviceConfig.updateIntervalMs) {
         lastTelemetryTime = currentMillis;
-        sendTelemetryToApi();
+        streamTelemetryOverWebSocket();
     }
 
-    delay(50);
+    delay(10);
 }
