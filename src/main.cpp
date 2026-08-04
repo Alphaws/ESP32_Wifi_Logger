@@ -310,30 +310,27 @@ bool performPingTest() {
     }
 }
 
-// Robust HTTPS POST helper supporting automatic 308 redirect handling & IP fallback with SNI Host header
+// Robust HTTPS POST helper supporting automatic 308 redirect handling & TLS SNI host header
 int executeApiPost(const String& path, const String& jsonBody, String& responseOut) {
     WiFiClientSecure client;
     client.setInsecure(); // Bypass SSL certificate verification for maximum compatibility
-    client.setTimeout(10000);
-
-    IPAddress targetIp;
-    bool resolved = WiFi.hostByName(API_DOMAIN, targetIp);
-    if (!resolved) {
-        targetIp = FALLBACK_API_IP;
-    }
+    client.setHandshakeTimeout(10);
 
     HTTPClient http;
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Follow 301/302/307/308 redirects automatically
     http.setTimeout(10000);
 
-    String fullUrl = "https://" + targetIp.toString() + path;
+    // Use domain autotracker.hu for proper Traefik SNI TLS routing
+    bool success = http.begin(client, API_DOMAIN, 443, path, true /* https */);
+    if (!success) {
+        Serial.println("HTTPClient begin failed!");
+        return -1;
+    }
 
-    http.begin(client, fullUrl);
-    http.addHeader("Host", API_DOMAIN);
     http.addHeader("Content-Type", "application/json");
 
-    Serial.printf("POST -> https://%s%s (via %s)\nPayload: %s\n",
-                  API_DOMAIN, path.c_str(), targetIp.toString().c_str(), jsonBody.c_str());
+    Serial.printf("POST -> https://%s:443%s\nPayload: %s\n",
+                  API_DOMAIN, path.c_str(), jsonBody.c_str());
 
     int httpCode = http.POST(jsonBody);
 
