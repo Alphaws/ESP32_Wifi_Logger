@@ -16,9 +16,15 @@ const char* API_DOMAIN = "autotracker.hu";
 const IPAddress FALLBACK_API_IP(159, 195, 55, 240);
 const uint16_t WS_PORT = 4000;
 
-// Wi-Fi credentials
-const char* WIFI_SSID = "awshotspot";
-const char* WIFI_PASS = "12345678";
+// Wi-Fi hálózatok – prioritás sorrendben próbálja végig
+struct WifiCredential { const char* ssid; const char* pass; };
+const WifiCredential WIFI_NETWORKS[] = {
+    { "awshotspot",   "12345678"  },  // 1. Mobil hotspot
+    { "HomeNetwork",  "password1" },  // 2. Otthoni WiFi
+    { "Garage",       "password2" },  // 3. Garázs/műhely
+    // Ide bővíthető további hálózatokkal...
+};
+const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
 // Timing Intervals
 const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 500; // 2 Hz telemetry stream (500ms)
@@ -416,27 +422,47 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     }
 }
 
-// Connect to Wi-Fi asynchronously while CAN buffer keeps recording
+// Connect to Wi-Fi — prioritás sorrendben végigpróbálja a hálózatokat
+// CAN bus rögzítés folytatódik minden kísérlet alatt!
 void connectToWifi() {
-    Serial.println("\nConnecting to Wi-Fi...");
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-    unsigned long startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < 20000)) {
-        captureCanBusMetrics();
-        delay(200);
+    for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+        const char* ssid = WIFI_NETWORKS[i].ssid;
+        const char* pass = WIFI_NETWORKS[i].pass;
+
+        Serial.printf("\n[WiFi] Próbálkozás (%d/%d): SSID='%s'\n", i + 1, WIFI_NETWORK_COUNT, ssid);
+        WiFi.disconnect(true);
+        delay(100);
+        WiFi.begin(ssid, pass);
+
+        unsigned long startAttempt = millis();
+        while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < 10000)) {
+            captureCanBusMetrics(); // CAN folytatódik!
+            delay(200);
+            Serial.print(".");
+        }
+        Serial.println();
+
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WiFi] ✅ Csatlakozva: '%s' | IP: %s\n", ssid, WiFi.localIP().toString().c_str());
+            setRgbColor(0, 0, 128);
+            IPAddress serverIp(159, 195, 55, 240);
+            webSocket.begin(serverIp, WS_PORT, "/ws");
+            webSocket.onEvent(webSocketEvent);
+            webSocket.setReconnectInterval(1000);
+            return; // Sikeres csatlakozás, kilépünk
+        }
+
+        Serial.printf("[WiFi] ❌ '%s' nem elérhető, következő...\n", ssid);
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
-        setRgbColor(0, 0, 128);
-        IPAddress serverIp(159, 195, 55, 240);
-        webSocket.begin(serverIp, WS_PORT, "/ws");
-        webSocket.onEvent(webSocketEvent);
-        webSocket.setReconnectInterval(1000);
-    }
+    // Egyik hálózat sem volt elérhető
+    Serial.println("[WiFi] ⚠️  Egyetlen hálózathoz sem sikerült csatlakozni!");
+    Serial.println("[WiFi] Offline módban folytatom a CAN rögzítést...");
+    setRgbColor(64, 0, 0); // Halványpiros = offline
 }
 
 // Flush Ring Buffer over Open WebSocket Connection with PID filtering
