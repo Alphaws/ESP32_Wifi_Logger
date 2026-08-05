@@ -19,10 +19,10 @@ const uint16_t WS_PORT = 4000;
 // Wi-Fi hálózatok – prioritás sorrendben próbálja végig
 struct WifiCredential { const char* ssid; const char* pass; };
 const WifiCredential WIFI_NETWORKS[] = {
-    { "awshotspot",   "12345678"  },  // 1. Mobil hotspot
-    { "HomeNetwork",  "password1" },  // 2. Otthoni WiFi
-    { "Garage",       "password2" },  // 3. Garázs/műhely
-    // Ide bővíthető további hálózatokkal...
+    { "awshotspot",   "12345678"   },  // 1. Mobil hotspot
+    { "aws01-24",     "1qaw3ed-"   },  // 2. AWS hálózat
+    { "HomeNetwork",  "password1"  },  // 3. Otthoni WiFi  ← szükség esetén cseréld
+    { "Garage",       "password2"  },  // 4. Garázs        ← szükség esetén cseréld
 };
 const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
