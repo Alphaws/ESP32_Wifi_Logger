@@ -39,15 +39,24 @@ const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 500; // 2 Hz telemetry strea
 
 struct BufferedTelemetry {
     uint32_t timestampMs;
+    // Original 6 fields
     int speedKmh;
     int engineRpm;
     int coolantTempC;
     int fuelLevelPct;
     float batteryVoltageV;
     int oilTempC;
+    // Extended OBD2 PIDs
+    int throttlePct;       // 0x11 Throttle position (%)
+    int engineLoadPct;     // 0x04 Engine load (%)
+    int intakeTempC;       // 0x0F Intake air temperature (°C)
+    float mafGs;           // 0x10 MAF rate (g/s)
+    float timingAdvanceDeg;// 0x0E Timing advance (°)
+    int boostKpa;          // 0x70 Turbo boost pressure (kPa)
+    // Diagnostics
     bool dtcActive;
     char dtcCodes[16];
-    bool isSimulated; // true if no real CAN bus data was detected
+    bool isSimulated;
 };
 
 struct DynamicConfig {
@@ -66,7 +75,7 @@ int queueTail = 0;
 int queueCount = 0;
 
 // Global State Variables
-BufferedTelemetry currentTelemetry = {0, 0, 0, 0, 0, 0.0f, 0, false, "", false};
+BufferedTelemetry currentTelemetry = {0, 0, 0, 0, 0, 0.0f, 0, 0, 0, 0, 0.0f, 0.0f, 0, false, "", false};
 DynamicConfig deviceConfig = {"Mercedes-Benz E-Class (W211)", "CAN_500K", "NORMAL", DEFAULT_TELEMETRY_INTERVAL_MS, true, false};
 
 // Dynamic PID Filter Flags
@@ -77,6 +86,13 @@ bool reqCoolant = true;
 bool reqBattery = true;
 bool reqFuel = true;
 bool reqOil = true;
+// Extended PID flags
+bool reqThrottle = false;
+bool reqEngineLoad = false;
+bool reqIntakeTemp = false;
+bool reqMaf = false;
+bool reqTimingAdv = false;
+bool reqBoost = false;
 
 unsigned long lastPingTime = 0;
 unsigned long lastTelemetryTime = 0;
@@ -145,41 +161,55 @@ void captureCanBusMetrics() {
         totalCanFramesRead++;
         if (message.identifier == 0x7E8 && message.data_length_code >= 4) {
             uint8_t pid = message.data[2];
-            if (pid == 0x0C) { // Engine RPM
-                currentTelemetry.engineRpm = ((message.data[3] * 256) + message.data[4]) / 4;
-            } else if (pid == 0x0D) { // Speed km/h
-                currentTelemetry.speedKmh = message.data[3];
-            } else if (pid == 0x05) { // Coolant temp
-                currentTelemetry.coolantTempC = message.data[3] - 40;
-            }
+            if      (pid == 0x0C) { currentTelemetry.engineRpm    = ((message.data[3] * 256) + message.data[4]) / 4; }
+            else if (pid == 0x0D) { currentTelemetry.speedKmh      = message.data[3]; }
+            else if (pid == 0x05) { currentTelemetry.coolantTempC  = message.data[3] - 40; }
+            else if (pid == 0x11) { currentTelemetry.throttlePct   = (message.data[3] * 100) / 255; }
+            else if (pid == 0x04) { currentTelemetry.engineLoadPct = (message.data[3] * 100) / 255; }
+            else if (pid == 0x0F) { currentTelemetry.intakeTempC   = message.data[3] - 40; }
+            else if (pid == 0x10) { currentTelemetry.mafGs         = ((message.data[3] * 256) + message.data[4]) / 100.0f; }
+            else if (pid == 0x0E) { currentTelemetry.timingAdvanceDeg = (message.data[3] / 2.0f) - 64.0f; }
+            else if (pid == 0x70) { currentTelemetry.boostKpa      = message.data[3]; }
         }
     }
 
     // If no live CAN vehicle attached during bench testing, generate dynamic simulated CAN readings
     bool simulating = (totalCanFramesRead == 0);
     if (simulating) {
-        currentTelemetry.speedKmh = random(50, 130);
-        currentTelemetry.engineRpm = random(1800, 3500);
-        currentTelemetry.coolantTempC = random(88, 95);
-        currentTelemetry.fuelLevelPct = random(40, 85);
-        currentTelemetry.batteryVoltageV = 13.8f + (random(-2, 3) / 10.0f);
-        currentTelemetry.oilTempC = random(90, 105);
-        currentTelemetry.dtcActive = (deviceConfig.mode == "SERVICE");
+        currentTelemetry.speedKmh          = random(50, 130);
+        currentTelemetry.engineRpm         = random(1800, 3500);
+        currentTelemetry.coolantTempC      = random(88, 95);
+        currentTelemetry.fuelLevelPct      = random(40, 85);
+        currentTelemetry.batteryVoltageV   = 13.8f + (random(-2, 3) / 10.0f);
+        currentTelemetry.oilTempC          = random(90, 105);
+        currentTelemetry.throttlePct       = random(5, 70);
+        currentTelemetry.engineLoadPct     = random(20, 80);
+        currentTelemetry.intakeTempC       = random(25, 45);
+        currentTelemetry.mafGs             = random(30, 180) / 10.0f;
+        currentTelemetry.timingAdvanceDeg  = random(80, 240) / 10.0f - 5.0f; // -5 to 19 deg
+        currentTelemetry.boostKpa          = random(100, 220); // 100=atm, 220=boost
+        currentTelemetry.dtcActive         = (deviceConfig.mode == "SERVICE");
         strncpy(currentTelemetry.dtcCodes, (deviceConfig.mode == "SERVICE") ? "P0300,P0171" : "NONE", sizeof(currentTelemetry.dtcCodes));
     }
     currentTelemetry.isSimulated = simulating;
 
     BufferedTelemetry sample;
-    sample.timestampMs = millis();
-    sample.speedKmh = currentTelemetry.speedKmh;
-    sample.engineRpm = currentTelemetry.engineRpm;
-    sample.coolantTempC = currentTelemetry.coolantTempC;
-    sample.fuelLevelPct = currentTelemetry.fuelLevelPct;
-    sample.batteryVoltageV = currentTelemetry.batteryVoltageV;
-    sample.oilTempC = currentTelemetry.oilTempC;
-    sample.dtcActive = currentTelemetry.dtcActive;
+    sample.timestampMs         = millis();
+    sample.speedKmh            = currentTelemetry.speedKmh;
+    sample.engineRpm           = currentTelemetry.engineRpm;
+    sample.coolantTempC        = currentTelemetry.coolantTempC;
+    sample.fuelLevelPct        = currentTelemetry.fuelLevelPct;
+    sample.batteryVoltageV     = currentTelemetry.batteryVoltageV;
+    sample.oilTempC            = currentTelemetry.oilTempC;
+    sample.throttlePct         = currentTelemetry.throttlePct;
+    sample.engineLoadPct       = currentTelemetry.engineLoadPct;
+    sample.intakeTempC         = currentTelemetry.intakeTempC;
+    sample.mafGs               = currentTelemetry.mafGs;
+    sample.timingAdvanceDeg    = currentTelemetry.timingAdvanceDeg;
+    sample.boostKpa            = currentTelemetry.boostKpa;
+    sample.dtcActive           = currentTelemetry.dtcActive;
     strncpy(sample.dtcCodes, currentTelemetry.dtcCodes, sizeof(sample.dtcCodes));
-    sample.isSimulated = simulating;
+    sample.isSimulated         = simulating;
 
     enqueueTelemetry(sample);
 }
@@ -229,15 +259,23 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                         JsonArray pids = doc["requestedPids"];
                         reqSpeed = false; reqRpm = false; reqCoolant = false;
                         reqBattery = false; reqFuel = false; reqOil = false;
+                        reqThrottle = false; reqEngineLoad = false; reqIntakeTemp = false;
+                        reqMaf = false; reqTimingAdv = false; reqBoost = false;
 
                         for (JsonVariant v : pids) {
                             String p = v.as<String>();
-                            if (p == "speed_kmh") reqSpeed = true;
-                            if (p == "rpm") reqRpm = true;
-                            if (p == "coolant_temp_c") reqCoolant = true;
-                            if (p == "battery_v") reqBattery = true;
-                            if (p == "fuel_pct") reqFuel = true;
-                            if (p == "oil_temp_c") reqOil = true;
+                            if (p == "speed_kmh")         reqSpeed      = true;
+                            if (p == "rpm")               reqRpm        = true;
+                            if (p == "coolant_temp_c")    reqCoolant    = true;
+                            if (p == "battery_v")         reqBattery    = true;
+                            if (p == "fuel_pct")          reqFuel       = true;
+                            if (p == "oil_temp_c")        reqOil        = true;
+                            if (p == "throttle_pct")      reqThrottle   = true;
+                            if (p == "engine_load_pct")   reqEngineLoad = true;
+                            if (p == "intake_temp_c")     reqIntakeTemp = true;
+                            if (p == "maf_gs")            reqMaf        = true;
+                            if (p == "timing_advance_deg") reqTimingAdv = true;
+                            if (p == "boost_kpa")         reqBoost      = true;
                         }
                         filterPidsEnabled = true;
                         Serial.println("⚡ [PID CONFIG UPDATED] Filtering CAN metric queries based on checkmarks!");
@@ -292,12 +330,18 @@ void flushTelemetryQueueOverWebSocket() {
         doc["sim_mode"] = sample.isSimulated; // true = no real CAN bus, test data only
 
         JsonObject tel = doc.createNestedObject("telemetry");
-        if (!filterPidsEnabled || reqSpeed) tel["speed_kmh"] = sample.speedKmh;
-        if (!filterPidsEnabled || reqRpm) tel["rpm"] = sample.engineRpm;
-        if (!filterPidsEnabled || reqCoolant) tel["coolant_temp_c"] = sample.coolantTempC;
-        if (!filterPidsEnabled || reqBattery) tel["battery_v"] = sample.batteryVoltageV;
-        if (!filterPidsEnabled || reqFuel) tel["fuel_pct"] = sample.fuelLevelPct;
-        if (!filterPidsEnabled || reqOil) tel["oil_temp_c"] = sample.oilTempC;
+        if (!filterPidsEnabled || reqSpeed)      tel["speed_kmh"]          = sample.speedKmh;
+        if (!filterPidsEnabled || reqRpm)        tel["rpm"]                = sample.engineRpm;
+        if (!filterPidsEnabled || reqCoolant)    tel["coolant_temp_c"]     = sample.coolantTempC;
+        if (!filterPidsEnabled || reqBattery)    tel["battery_v"]          = sample.batteryVoltageV;
+        if (!filterPidsEnabled || reqFuel)       tel["fuel_pct"]           = sample.fuelLevelPct;
+        if (!filterPidsEnabled || reqOil)        tel["oil_temp_c"]         = sample.oilTempC;
+        if (!filterPidsEnabled || reqThrottle)   tel["throttle_pct"]       = sample.throttlePct;
+        if (!filterPidsEnabled || reqEngineLoad) tel["engine_load_pct"]    = sample.engineLoadPct;
+        if (!filterPidsEnabled || reqIntakeTemp) tel["intake_temp_c"]      = sample.intakeTempC;
+        if (!filterPidsEnabled || reqMaf)        tel["maf_gs"]             = sample.mafGs;
+        if (!filterPidsEnabled || reqTimingAdv)  tel["timing_advance_deg"] = sample.timingAdvanceDeg;
+        if (!filterPidsEnabled || reqBoost)      tel["boost_kpa"]          = sample.boostKpa;
 
         if (deviceConfig.mode == "SERVICE") {
             JsonObject serviceDiag = doc.createNestedObject("service_diagnostics");
