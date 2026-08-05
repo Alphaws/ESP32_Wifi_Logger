@@ -11,7 +11,7 @@
 // =========================================================================
 // VEHICLE IDENTIFICATION & DEVICE CONFIGURATION
 // =========================================================================
-const char* VEHICLE_VIN = "WDB2110001A123456"; // Alvázszám (Vehicle Identification Number)
+const char* FALLBACK_VIN = "WDB2110001A123456"; // Fallback ha az OBD2 VIN lekérés sikertelen
 const char* API_DOMAIN = "autotracker.hu";
 const IPAddress FALLBACK_API_IP(159, 195, 55, 240);
 const uint16_t WS_PORT = 4000;
@@ -101,6 +101,10 @@ uint32_t totalCanFramesRead = 0;
 
 IPAddress resolvedServerIp = FALLBACK_API_IP;
 
+// Auto-detected VIN (via OBD2 Mode 09 PID 02)
+char detectedVin[18]   = {0}; // 17 chars + null
+bool vinAutoDetected   = false;
+
 // Persistent WebSocket Client Instance
 WebSocketsClient webSocket;
 bool isWsConnected = false;
@@ -152,6 +156,108 @@ void initCanBus() {
     } else {
         Serial.println("WARNING: Failed to start TWAI driver.");
     }
+}
+
+// =========================================================================
+// OBD2 VIN REQUEST — ISO-TP Multi-Frame (Mode 09 PID 02)
+// Sends a broadcast OBD2 request and assembles the 17-char VIN from
+// the ECU's ISO-TP First Frame + Consecutive Frames.
+// Returns true if a valid VIN was received within timeout.
+// =========================================================================
+bool requestVinFromEcu() {
+    Serial.println("\n[VIN] Sending OBD2 Mode 09 PID 02 request (ISO-TP)...");
+
+    // OBD2 functional broadcast request: 02 09 02 (Mode 09, PID 02 = VIN)
+    twai_message_t req;
+    req.identifier       = 0x7DF;
+    req.flags            = TWAI_MSG_FLAG_NONE;
+    req.data_length_code = 8;
+    req.data[0] = 0x02; // Single frame, length 2
+    req.data[1] = 0x09; // Mode 09 — vehicle info
+    req.data[2] = 0x02; // PID 02 — VIN
+    req.data[3] = 0x00; req.data[4] = 0x00;
+    req.data[5] = 0x00; req.data[6] = 0x00; req.data[7] = 0x00;
+
+    if (twai_transmit(&req, pdMS_TO_TICKS(200)) != ESP_OK) {
+        Serial.println("[VIN] CAN transmit failed.");
+        return false;
+    }
+
+    char vin[18]      = {0};
+    int  vinIdx       = 0;
+    bool gotFirstFrame = false;
+    unsigned long deadline = millis() + 3000; // 3s timeout
+
+    while (millis() < deadline) {
+        twai_message_t msg;
+        if (twai_receive(&msg, pdMS_TO_TICKS(50)) != ESP_OK) continue;
+
+        // Only accept responses from standard ECU response ID
+        if (msg.identifier != 0x7E8) continue;
+
+        uint8_t nibble = (msg.data[0] >> 4) & 0x0F;
+
+        if (nibble == 0x1) {
+            // === FIRST FRAME ===
+            // Byte 0-1: 0x10, total_length
+            // Byte 2: 0x49, Byte 3: 0x02, Byte 4: 0x01 (number of data items)
+            // Byte 5-7: first 3 VIN characters
+            if (msg.data[2] != 0x49 || msg.data[3] != 0x02) continue;
+            for (int i = 5; i < 8 && vinIdx < 17; i++) {
+                if (msg.data[i] >= 0x20 && msg.data[i] <= 0x7E)
+                    vin[vinIdx++] = (char)msg.data[i];
+            }
+            gotFirstFrame = true;
+
+            // Send Flow Control: ContinueToSend, block=0, STmin=0
+            twai_message_t fc;
+            fc.identifier       = 0x7E0;
+            fc.flags            = TWAI_MSG_FLAG_NONE;
+            fc.data_length_code = 8;
+            fc.data[0] = 0x30; fc.data[1] = 0x00; fc.data[2] = 0x00;
+            fc.data[3] = 0x00; fc.data[4] = 0x00; fc.data[5] = 0x00;
+            fc.data[6] = 0x00; fc.data[7] = 0x00;
+            twai_transmit(&fc, pdMS_TO_TICKS(100));
+            Serial.printf("[VIN] First frame received, sent Flow Control. VIN so far: %.3s\n", vin);
+
+        } else if (nibble == 0x2 && gotFirstFrame) {
+            // === CONSECUTIVE FRAME ===
+            // Byte 0: 0x21, 0x22 ... (sequence number)
+            // Byte 1-7: next VIN characters
+            for (int i = 1; i < 8 && vinIdx < 17; i++) {
+                if (msg.data[i] >= 0x20 && msg.data[i] <= 0x7E)
+                    vin[vinIdx++] = (char)msg.data[i];
+            }
+            Serial.printf("[VIN] Consecutive frame, VIN so far (%d/17): %s\n", vinIdx, vin);
+
+            if (vinIdx >= 17) break; // All 17 characters received
+        }
+    }
+
+    vin[17] = '\0';
+
+    if (vinIdx == 17) {
+        // Basic VIN format validation (A-Z, 0-9, no I/O/Q)
+        bool valid = true;
+        for (int i = 0; i < 17; i++) {
+            char c = vin[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+                valid = false; break;
+            }
+            if (c == 'I' || c == 'O' || c == 'Q') { valid = false; break; }
+        }
+        if (valid) {
+            strncpy(detectedVin, vin, 18);
+            vinAutoDetected = true;
+            Serial.printf("[VIN] ✅ Auto-detected VIN: %s\n", detectedVin);
+            return true;
+        } else {
+            Serial.printf("[VIN] ⚠️  Invalid VIN chars: %s — using fallback\n", vin);
+        }
+    } else {
+        Serial.printf("[VIN] ⚠️  Only got %d/17 chars — using fallback VIN\n", vinIdx);
+    }
+    return false;
 }
 
 // Read CAN Bus frames continuously and store into Ring Buffer
@@ -229,12 +335,13 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             Serial.printf("⚡ [WebSocket] Connected to ws://159.195.55.240:%u/ws!\n", WS_PORT);
             
             {
-                StaticJsonDocument<256> doc;
-                doc["type"] = "handshake";
-                doc["vin"] = VEHICLE_VIN;
-                doc["mac"] = WiFi.macAddress();
-                doc["rssi"] = WiFi.RSSI();
-                doc["firmware_version"] = "2.2.0_DynamicPids";
+                StaticJsonDocument<300> doc;
+                doc["type"]             = "handshake";
+                doc["vin"]              = detectedVin;
+                doc["vin_source"]       = vinAutoDetected ? "obd2_auto" : "fallback";
+                doc["mac"]              = WiFi.macAddress();
+                doc["rssi"]             = WiFi.RSSI();
+                doc["firmware_version"] = "2.3.0_AutoVin";
 
                 String msg;
                 serializeJson(doc, msg);
@@ -254,6 +361,26 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
                             deviceConfig.mode = newMode;
                             Serial.printf("⚡ MODE CHANGE RECEIVED -> %s\n", newMode.c_str());
                         }
+                    }
+                    if (doc.containsKey("type") && doc["type"] == "config_response") {
+                        // Server responded with vehicle profile after handshake
+                        String assignedMode    = doc["mode"] | "NORMAL";
+                        bool   vehicleFound    = doc["vehicle_found"] | false;
+                        bool   autoReg         = doc["auto_registered"] | false;
+                        const char* makeModel  = doc["make_model"] | "N/A";
+                        const char* plate      = doc["plate"] | "N/A";
+                        deviceConfig.mode      = assignedMode;
+                        deviceConfig.updateIntervalMs = doc["update_interval_ms"] | DEFAULT_TELEMETRY_INTERVAL_MS;
+
+                        Serial.println(F("=== SERVER CONFIG RESPONSE ==="));
+                        Serial.printf("  VIN:          %s\n", detectedVin);
+                        Serial.printf("  VIN Source:   %s\n", vinAutoDetected ? "OBD2 Auto-detected" : "Fallback (no CAN)");
+                        Serial.printf("  Vehicle DB:   %s\n", vehicleFound ? "FOUND" : (autoReg ? "AUTO-REGISTERED" : "NOT FOUND"));
+                        Serial.printf("  Make/Model:   %s\n", makeModel);
+                        Serial.printf("  Plate:        %s\n", plate);
+                        Serial.printf("  Mode:         %s\n", assignedMode.c_str());
+                        Serial.printf("  Interval:     %lu ms\n", deviceConfig.updateIntervalMs);
+                        Serial.println(F("=============================="));
                     }
                     if (doc.containsKey("type") && doc["type"] == "pid_config") {
                         JsonArray pids = doc["requestedPids"];
@@ -325,7 +452,7 @@ void flushTelemetryQueueOverWebSocket() {
 
         StaticJsonDocument<512> doc;
         doc["type"] = "telemetry";
-        doc["vin"] = VEHICLE_VIN;
+        doc["vin"] = detectedVin;
         doc["mode"] = deviceConfig.mode;
         doc["sim_mode"] = sample.isSimulated; // true = no real CAN bus, test data only
 
@@ -360,6 +487,15 @@ void setup() {
     setRgbColor(128, 0, 0);
     delay(500);
     initCanBus();
+
+    // Attempt automatic VIN detection from ECU via OBD2 ISO-TP
+    // If the car is not connected or doesn't respond, falls back to FALLBACK_VIN
+    if (!requestVinFromEcu()) {
+        strncpy(detectedVin, FALLBACK_VIN, 18);
+        vinAutoDetected = false;
+        Serial.printf("[VIN] Using fallback VIN: %s\n", detectedVin);
+    }
+
     connectToWifi();
     lastTelemetryTime = millis();
 }
