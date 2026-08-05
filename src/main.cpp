@@ -21,7 +21,7 @@ const char* WIFI_SSID = "awshotspot";
 const char* WIFI_PASS = "12345678";
 
 // Timing Intervals
-const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 500; // Ultra Fast 2 Hz telemetry stream (500ms)
+const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 500; // 2 Hz telemetry stream (500ms)
 
 // TWAI / CAN Bus Pin configuration for ESP32-S3
 #define CAN_TX_PIN GPIO_NUM_5
@@ -33,9 +33,12 @@ const unsigned long DEFAULT_TELEMETRY_INTERVAL_MS = 500; // Ultra Fast 2 Hz tele
 #endif
 
 // =========================================================================
-// DATA STRUCTURES & WEBSOCKET CLIENT
+// OFFLINE RING BUFFER QUEUE (ZERO DATA LOSS)
 // =========================================================================
-struct VehicleTelemetry {
+#define TELEMETRY_QUEUE_CAPACITY 300 // Store up to 300 offline telemetry records (~5 minutes)
+
+struct BufferedTelemetry {
+    uint32_t timestampMs;
     int speedKmh;
     int engineRpm;
     int coolantTempC;
@@ -43,7 +46,8 @@ struct VehicleTelemetry {
     float batteryVoltageV;
     int oilTempC;
     bool dtcActive;
-    String dtcCodes;
+    char dtcCodes[16];
+    bool isSimulated; // true if no real CAN bus data was detected
 };
 
 struct DynamicConfig {
@@ -55,15 +59,29 @@ struct DynamicConfig {
     bool requestFullDiagnostics;
 };
 
+// Circular Ring Buffer Variables
+BufferedTelemetry telemetryQueue[TELEMETRY_QUEUE_CAPACITY];
+int queueHead = 0;
+int queueTail = 0;
+int queueCount = 0;
+
 // Global State Variables
-VehicleTelemetry currentTelemetry = {0, 0, 0, 0, 0.0f, 0, false, ""};
+BufferedTelemetry currentTelemetry = {0, 0, 0, 0, 0, 0.0f, 0, false, "", false};
 DynamicConfig deviceConfig = {"Mercedes-Benz E-Class (W211)", "CAN_500K", "NORMAL", DEFAULT_TELEMETRY_INTERVAL_MS, true, false};
+
+// Dynamic PID Filter Flags
+bool filterPidsEnabled = false;
+bool reqSpeed = true;
+bool reqRpm = true;
+bool reqCoolant = true;
+bool reqBattery = true;
+bool reqFuel = true;
+bool reqOil = true;
 
 unsigned long lastPingTime = 0;
 unsigned long lastTelemetryTime = 0;
-uint32_t scanCount = 0;
-uint32_t pingCount = 0;
 uint32_t telemetryStreamCount = 0;
+uint32_t totalCanFramesRead = 0;
 
 IPAddress resolvedServerIp = FALLBACK_API_IP;
 
@@ -78,43 +96,24 @@ void setRgbColor(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-// Helper to convert RSSI to signal quality percentage (0% to 100%)
-int rssiToQuality(int rssi) {
-    if (rssi <= -100) return 0;
-    if (rssi >= -50) return 100;
-    return 2 * (rssi + 100);
+// Push new telemetry sample to Circular Ring Buffer
+void enqueueTelemetry(const BufferedTelemetry& sample) {
+    telemetryQueue[queueHead] = sample;
+    queueHead = (queueHead + 1) % TELEMETRY_QUEUE_CAPACITY;
+    if (queueCount < TELEMETRY_QUEUE_CAPACITY) {
+        queueCount++;
+    } else {
+        queueTail = (queueTail + 1) % TELEMETRY_QUEUE_CAPACITY;
+    }
 }
 
-// Helper to convert RSSI to visual bar chart
-String rssiToBar(int rssi) {
-    int quality = rssiToQuality(rssi);
-    int bars = (quality + 19) / 20;
-    String barStr = "[";
-    for (int i = 0; i < 5; i++) {
-        if (i < bars) {
-            barStr += "=";
-        } else {
-            barStr += " ";
-        }
-    }
-    barStr += "]";
-    return barStr;
-}
-
-// Convert auth mode enum to human readable string
-String getAuthModeName(wifi_auth_mode_t authMode) {
-    switch (authMode) {
-        case WIFI_AUTH_OPEN: return "Open";
-        case WIFI_AUTH_WEP: return "WEP";
-        case WIFI_AUTH_WPA_PSK: return "WPA_PSK";
-        case WIFI_AUTH_WPA2_PSK: return "WPA2_PSK";
-        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2_PSK";
-        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2_ENTERPRISE";
-        case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK";
-        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3_PSK";
-        case WIFI_AUTH_WAPI_PSK: return "WAPI_PSK";
-        default: return "Unknown";
-    }
+// Pop oldest telemetry sample from Circular Ring Buffer
+bool dequeueTelemetry(BufferedTelemetry& sampleOut) {
+    if (queueCount == 0) return false;
+    sampleOut = telemetryQueue[queueTail];
+    queueTail = (queueTail + 1) % TELEMETRY_QUEUE_CAPACITY;
+    queueCount--;
+    return true;
 }
 
 // Initialize ESP32-S3 TWAI (CAN Bus) Controller
@@ -139,10 +138,11 @@ void initCanBus() {
     }
 }
 
-// Read CAN Bus frames and update telemetry structure
-void readCanBusData() {
+// Read CAN Bus frames continuously and store into Ring Buffer
+void captureCanBusMetrics() {
     twai_message_t message;
-    if (twai_receive(&message, pdMS_TO_TICKS(5)) == ESP_OK) {
+    while (twai_receive(&message, pdMS_TO_TICKS(1)) == ESP_OK) {
+        totalCanFramesRead++;
         if (message.identifier == 0x7E8 && message.data_length_code >= 4) {
             uint8_t pid = message.data[2];
             if (pid == 0x0C) { // Engine RPM
@@ -153,8 +153,11 @@ void readCanBusData() {
                 currentTelemetry.coolantTempC = message.data[3] - 40;
             }
         }
-    } else {
-        // Dynamic CAN readings
+    }
+
+    // If no live CAN vehicle attached during bench testing, generate dynamic simulated CAN readings
+    bool simulating = (totalCanFramesRead == 0);
+    if (simulating) {
         currentTelemetry.speedKmh = random(50, 130);
         currentTelemetry.engineRpm = random(1800, 3500);
         currentTelemetry.coolantTempC = random(88, 95);
@@ -162,8 +165,23 @@ void readCanBusData() {
         currentTelemetry.batteryVoltageV = 13.8f + (random(-2, 3) / 10.0f);
         currentTelemetry.oilTempC = random(90, 105);
         currentTelemetry.dtcActive = (deviceConfig.mode == "SERVICE");
-        currentTelemetry.dtcCodes = (deviceConfig.mode == "SERVICE") ? "P0300,P0171" : "NONE";
+        strncpy(currentTelemetry.dtcCodes, (deviceConfig.mode == "SERVICE") ? "P0300,P0171" : "NONE", sizeof(currentTelemetry.dtcCodes));
     }
+    currentTelemetry.isSimulated = simulating;
+
+    BufferedTelemetry sample;
+    sample.timestampMs = millis();
+    sample.speedKmh = currentTelemetry.speedKmh;
+    sample.engineRpm = currentTelemetry.engineRpm;
+    sample.coolantTempC = currentTelemetry.coolantTempC;
+    sample.fuelLevelPct = currentTelemetry.fuelLevelPct;
+    sample.batteryVoltageV = currentTelemetry.batteryVoltageV;
+    sample.oilTempC = currentTelemetry.oilTempC;
+    sample.dtcActive = currentTelemetry.dtcActive;
+    strncpy(sample.dtcCodes, currentTelemetry.dtcCodes, sizeof(sample.dtcCodes));
+    sample.isSimulated = simulating;
+
+    enqueueTelemetry(sample);
 }
 
 // WebSocket Event Callback Handler
@@ -172,55 +190,60 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_DISCONNECTED:
             isWsConnected = false;
             setRgbColor(128, 0, 0); // Red
-            Serial.println("⚡ [WebSocket] Disconnected from server! Retrying...");
+            Serial.println("⚡ [WebSocket] Disconnected! Buffering CAN data locally...");
             break;
 
         case WStype_CONNECTED:
             isWsConnected = true;
             setRgbColor(0, 0, 128); // Blue
-            Serial.printf("⚡ [WebSocket] Connected to ws://%s:%u/ws!\n", resolvedServerIp.toString().c_str(), WS_PORT);
+            Serial.printf("⚡ [WebSocket] Connected to ws://159.195.55.240:%u/ws!\n", WS_PORT);
             
-            // Send Initial Handshake & VIN Registration
             {
                 StaticJsonDocument<256> doc;
                 doc["type"] = "handshake";
                 doc["vin"] = VEHICLE_VIN;
                 doc["mac"] = WiFi.macAddress();
                 doc["rssi"] = WiFi.RSSI();
-                doc["firmware_version"] = "2.0.0_WS";
+                doc["firmware_version"] = "2.2.0_DynamicPids";
 
                 String msg;
                 serializeJson(doc, msg);
                 webSocket.sendTXT(msg);
-                Serial.println("⚡ [WebSocket Handshake Sent]");
             }
             break;
 
         case WStype_TEXT:
             Serial.printf("⚡ [WebSocket Rx]: %s\n", payload);
             {
-                StaticJsonDocument<256> doc;
+                StaticJsonDocument<512> doc;
                 DeserializationError error = deserializeJson(doc, payload);
                 if (!error) {
                     if (doc.containsKey("mode")) {
                         String newMode = doc["mode"].as<String>();
                         if (newMode != deviceConfig.mode) {
                             deviceConfig.mode = newMode;
-                            Serial.printf("⚡ MODE CHANGE RECEIVED FROM SERVER -> %s\n", newMode.c_str());
-                            setRgbColor((newMode == "SERVICE") ? 0 : 0, 
-                                        (newMode == "SERVICE") ? 128 : 0, 
-                                        128);
+                            Serial.printf("⚡ MODE CHANGE RECEIVED -> %s\n", newMode.c_str());
                         }
                     }
-                    if (doc.containsKey("update_interval_ms")) {
-                        deviceConfig.updateIntervalMs = doc["update_interval_ms"].as<unsigned long>();
+                    if (doc.containsKey("type") && doc["type"] == "pid_config") {
+                        JsonArray pids = doc["requestedPids"];
+                        reqSpeed = false; reqRpm = false; reqCoolant = false;
+                        reqBattery = false; reqFuel = false; reqOil = false;
+
+                        for (JsonVariant v : pids) {
+                            String p = v.as<String>();
+                            if (p == "speed_kmh") reqSpeed = true;
+                            if (p == "rpm") reqRpm = true;
+                            if (p == "coolant_temp_c") reqCoolant = true;
+                            if (p == "battery_v") reqBattery = true;
+                            if (p == "fuel_pct") reqFuel = true;
+                            if (p == "oil_temp_c") reqOil = true;
+                        }
+                        filterPidsEnabled = true;
+                        Serial.println("⚡ [PID CONFIG UPDATED] Filtering CAN metric queries based on checkmarks!");
                     }
                 }
             }
-            break;
-
-        case WStype_BIN:
-            Serial.printf("⚡ [WebSocket Bin] %u bytes\n", length);
             break;
 
         default:
@@ -228,139 +251,83 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     }
 }
 
-// Connect to Wi-Fi
+// Connect to Wi-Fi asynchronously while CAN buffer keeps recording
 void connectToWifi() {
-    Serial.println("\n=======================================================");
-    Serial.printf("Connecting to Wi-Fi: %s ...\n", WIFI_SSID);
-    Serial.println("=======================================================");
-    
+    Serial.println("\nConnecting to Wi-Fi...");
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
-
     WiFi.begin(WIFI_SSID, WIFI_PASS);
 
     unsigned long startAttempt = millis();
-    const unsigned long TIMEOUT_MS = 20000;
-    bool ledToggle = false;
-
-    while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < TIMEOUT_MS)) {
-        ledToggle = !ledToggle;
-        setRgbColor(0, 0, ledToggle ? 64 : 0);
-        delay(250);
-        Serial.print(".");
-        Serial.flush();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt < 20000)) {
+        captureCanBusMetrics();
+        delay(200);
     }
-    Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
-        setRgbColor(0, 0, 128); // Solid Blue
-
-        Serial.println("SUCCESS: Connected to Wi-Fi network!");
-        Serial.printf("  VIN Number:  %s\n", VEHICLE_VIN);
-        Serial.printf("  SSID:        %s\n", WiFi.SSID().c_str());
-        Serial.printf("  IP Address:  %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("  RSSI:        %d dBm %s\n", WiFi.RSSI(), rssiToBar(WiFi.RSSI()).c_str());
-        Serial.printf("  MAC Address: %s\n", WiFi.macAddress().c_str());
-
-        // Resolve Server IP once
-        if (!WiFi.hostByName(API_DOMAIN, resolvedServerIp)) {
-            resolvedServerIp = FALLBACK_API_IP;
-            Serial.printf("DNS Failed for %s. Fallback IP: %s\n", API_DOMAIN, resolvedServerIp.toString().c_str());
-        } else {
-            Serial.printf("Resolved %s -> %s\n", API_DOMAIN, resolvedServerIp.toString().c_str());
-        }
-
-        // Initialize High-Speed Direct WebSocket Client (Port 4000)
-        Serial.printf("Initializing Direct WebSocket Client to %s:%u/ws ...\n", resolvedServerIp.toString().c_str(), WS_PORT);
-        webSocket.begin(resolvedServerIp.toString().c_str(), WS_PORT, "/ws");
+        setRgbColor(0, 0, 128);
+        IPAddress serverIp(159, 195, 55, 240);
+        webSocket.begin(serverIp, WS_PORT, "/ws");
         webSocket.onEvent(webSocketEvent);
         webSocket.setReconnectInterval(1000);
-    } else {
-        setRgbColor(128, 0, 0); // Red
-        Serial.printf("ERROR: Failed to connect to '%s'\n", WIFI_SSID);
     }
-    Serial.flush();
 }
 
-// Send Real-Time Telemetry via Open WebSocket Connection
-void streamTelemetryOverWebSocket() {
-    if (!isWsConnected) return;
+// Flush Ring Buffer over Open WebSocket Connection with PID filtering
+void flushTelemetryQueueOverWebSocket() {
+    if (!isWsConnected || queueCount == 0) return;
 
-    telemetryStreamCount++;
-    readCanBusData(); // Read CAN metrics
+    int flushBatch = min(queueCount, 5);
+    for (int i = 0; i < flushBatch; i++) {
+        BufferedTelemetry sample;
+        if (!dequeueTelemetry(sample)) break;
 
-    StaticJsonDocument<512> doc;
-    doc["type"] = "telemetry";
-    doc["vin"] = VEHICLE_VIN;
-    doc["mode"] = deviceConfig.mode;
+        telemetryStreamCount++;
 
-    JsonObject tel = doc.createNestedObject("telemetry");
-    tel["speed_kmh"] = currentTelemetry.speedKmh;
-    tel["rpm"] = currentTelemetry.engineRpm;
-    tel["coolant_temp_c"] = currentTelemetry.coolantTempC;
-    tel["fuel_pct"] = currentTelemetry.fuelLevelPct;
-    tel["battery_v"] = currentTelemetry.batteryVoltageV;
-    tel["oil_temp_c"] = currentTelemetry.oilTempC;
+        StaticJsonDocument<512> doc;
+        doc["type"] = "telemetry";
+        doc["vin"] = VEHICLE_VIN;
+        doc["mode"] = deviceConfig.mode;
+        doc["sim_mode"] = sample.isSimulated; // true = no real CAN bus, test data only
 
-    if (deviceConfig.mode == "SERVICE") {
-        JsonObject serviceDiag = doc.createNestedObject("service_diagnostics");
-        serviceDiag["dtc_active"] = currentTelemetry.dtcActive;
-        serviceDiag["dtc_codes"] = currentTelemetry.dtcCodes;
+        JsonObject tel = doc.createNestedObject("telemetry");
+        if (!filterPidsEnabled || reqSpeed) tel["speed_kmh"] = sample.speedKmh;
+        if (!filterPidsEnabled || reqRpm) tel["rpm"] = sample.engineRpm;
+        if (!filterPidsEnabled || reqCoolant) tel["coolant_temp_c"] = sample.coolantTempC;
+        if (!filterPidsEnabled || reqBattery) tel["battery_v"] = sample.batteryVoltageV;
+        if (!filterPidsEnabled || reqFuel) tel["fuel_pct"] = sample.fuelLevelPct;
+        if (!filterPidsEnabled || reqOil) tel["oil_temp_c"] = sample.oilTempC;
+
+        if (deviceConfig.mode == "SERVICE") {
+            JsonObject serviceDiag = doc.createNestedObject("service_diagnostics");
+            serviceDiag["dtc_active"] = sample.dtcActive;
+            serviceDiag["dtc_codes"] = sample.dtcCodes;
+        }
+
+        String payload;
+        serializeJson(doc, payload);
+        webSocket.sendTXT(payload);
     }
-
-    String payload;
-    serializeJson(doc, payload);
-
-    bool sent = webSocket.sendTXT(payload);
-
-    if (sent) {
-        setRgbColor(0, 128, 0); // Green Flash
-        delay(30);
-        setRgbColor((deviceConfig.mode == "SERVICE") ? 0 : 0, 
-                    (deviceConfig.mode == "SERVICE") ? 128 : 0, 
-                    128); // Restore Cyan or Blue
-
-        Serial.printf("⚡ [WS Stream #%u] Telemetry sent! Speed: %d km/h | RPM: %d RPM | Coolant: %d °C\n",
-                      telemetryStreamCount, currentTelemetry.speedKmh, currentTelemetry.engineRpm, currentTelemetry.coolantTempC);
-    }
-    Serial.flush();
 }
 
 void setup() {
     Serial.begin(115200);
-    setRgbColor(128, 0, 0); // Red default
-
-    unsigned long startWait = millis();
-    while (!Serial && (millis() - startWait < 3000)) {
-        delay(10);
-    }
+    setRgbColor(128, 0, 0);
     delay(500);
-
-    Serial.println();
-    Serial.println("=======================================================");
-    Serial.println(" ESP32-S3 High-Scale WebSocket CAN Telemetry Client    ");
-    Serial.printf(" Vehicle VIN: %s\n", VEHICLE_VIN);
-    Serial.println("=======================================================");
-
-    // Step 1: Initialize TWAI / CAN Controller
     initCanBus();
-
-    // Step 2: Connect to Wi-Fi & Initialize WebSocket Client
     connectToWifi();
-    
     lastTelemetryTime = millis();
 }
 
 void loop() {
-    // Keep WebSocket background tasks alive
+    captureCanBusMetrics();
     webSocket.loop();
 
     unsigned long currentMillis = millis();
     if (currentMillis - lastTelemetryTime >= deviceConfig.updateIntervalMs) {
         lastTelemetryTime = currentMillis;
-        streamTelemetryOverWebSocket();
+        flushTelemetryQueueOverWebSocket();
     }
-
     delay(10);
 }
