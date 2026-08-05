@@ -528,7 +528,20 @@ void setup() {
 
 void loop() {
     captureCanBusMetrics();
-    webSocket.loop();
+
+    // Wi-Fi Auto-reconnect monitor: if connection is lost, retries configured network list every 15s
+    if (WiFi.status() != WL_CONNECTED) {
+        isWsConnected = false;
+        setRgbColor(128, 0, 0); // Red = offline
+        static unsigned long lastWifiRetry = 0;
+        if (millis() - lastWifiRetry > 15000) {
+            lastWifiRetry = millis();
+            Serial.println(F("\n[WiFi Monitor] ⚠️ Connection lost! Retrying WiFi network list..."));
+            connectToWifi();
+        }
+    } else {
+        webSocket.loop();
+    }
 
     unsigned long currentMillis = millis();
     if (currentMillis - lastTelemetryTime >= deviceConfig.updateIntervalMs) {
